@@ -141,19 +141,18 @@ function downloadExcel(data) {
     { name:"기타사항", cols:[20,80],
       rows:[["기타사항"],[],["구분","내용"],...data.etc.filter(r=>r.content).map(r=>[r.category,r.content])]},
     { name:"이슈내역", cols:[12,20,30,30,30,12,12],
-      rows:[["이슈내역"],[],["발생일","시스템","장애요약","원인","조치내용","상태","담당자"],
+      rows:[["이슈내역"],[],["발생일","시스템","이슈요약","원인","조치내용","상태","담당자"],
         ...data.inc.filter(r=>r.summary).map(r=>[r.occurDate,r.system,r.summary,r.cause,r.action,r.status,r.itOps])]},
   ];
-  const payload = JSON.stringify({ sheets, fn:`주간보고_${data.code}.xlsx` });
-  const html = `<!DOCTYPE html><html><head><script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script></head><body><script>(function(){
-const d=${payload};const wb=XLSX.utils.book_new();
-d.sheets.forEach(s=>{const ws=XLSX.utils.aoa_to_sheet(s.rows);
-ws['!cols']=s.cols.map(w=>({wch:w}));
-if(s.cols.length>1)ws['!merges']=[{s:{r:0,c:0},e:{r:0,c:s.cols.length-1}}];
-XLSX.utils.book_append_sheet(wb,ws,s.name);});
-XLSX.writeFile(wb,d.fn);setTimeout(()=>window.close(),600);
-})();</script></body></html>`;
-  window.open(URL.createObjectURL(new Blob([html],{type:"text/html"})),"_blank");
+  // SheetJS 직접 사용 (인라인 HTML 문자열 없이)
+  const wb = XLSX.utils.book_new();
+  sheets.forEach(s => {
+    const ws = XLSX.utils.aoa_to_sheet(s.rows);
+    ws["!cols"] = s.cols.map(w => ({ wch: w }));
+    if (s.cols.length > 1) ws["!merges"] = [{ s:{r:0,c:0}, e:{r:0,c:s.cols.length-1} }];
+    XLSX.utils.book_append_sheet(wb, ws, s.name);
+  });
+  XLSX.writeFile(wb, `주간보고_${data.code}.xlsx`);
 }
 
 // 현재 날짜 기준 ISO 주차 계산
