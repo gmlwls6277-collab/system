@@ -1,0 +1,1297 @@
+import { useState, useCallback } from "react";
+
+// ══════════════════════════════════════════════════════════
+//  상수
+// ══════════════════════════════════════════════════════════
+const TEAMS   = ["","모바일","DAX","플랫폼","인프라","기획","QA","기타"];
+const SYSTEMS = ["","윤활유 - Kixx Oil","myDAX","이파트너","프로젝트 지원","운영 지원","EV 충전소 홈페이지","기타"];
+const PROG    = ["0","10","20","30","40","50","60","70","80","90","100"];
+const TABS    = [
+  { id:"ops",      label:"운영업무", icon:"⚙️", primary:true  },
+  { id:"narrative",label:"서술보고", icon:"📝", primary:true  },
+  { id:"improve",  label:"개선활동", icon:"🔧", primary:false },
+  { id:"etc",      label:"기타사항", icon:"📌", primary:false },
+  { id:"incident", label:"이슈내역", icon:"🚨", primary:false },
+];
+const ETC_CATS = ["공지사항","협업 요청","외부 이슈","기타"];
+
+const pColor = p => { const n=parseInt(p); return n===100?"#16a34a":n>=70?"#2563eb":n>=40?"#d97706":"#dc2626"; };
+const uid    = () => crypto.randomUUID();
+
+const mkOps        = () => ({ id:uid(), teamName:"", systemName:"", taskName:"", week:"",
+  detailItems:[""], hasIssue:false, isNew:false, progress:"100",
+  startDate:"", endDate:"", itOpsList:[""], itOpt:"" });
+const detailsText  = row => (row.detailItems||[""]).filter(Boolean).join("\n");
+const mkImprove  = () => ({ id:uid(), category:"", title:"", current:"", plan:"", effect:"", status:"진행중", itOps:"" });
+const mkIncident = () => ({ id:uid(), occurDate:"", system:"", summary:"", cause:"", action:"", status:"처리완료", itOps:"" });
+const mkEtc      = c  => ({ id:uid(), category:c, content:"" });
+
+// ══════════════════════════════════════════════════════════
+//  AI 호출
+// ══════════════════════════════════════════════════════════
+async function callClaude(system, user, maxTokens=1400) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ model:"claude-sonnet-4-20250514", max_tokens:maxTokens,
+      system, messages:[{role:"user", content:user}] })
+  });
+  const d = await res.json();
+  return d.content?.[0]?.text || "";
+}
+
+// 운영업무 → 서술보고 자동생성
+// ★ 핵심 수정: 입력된 업무 개수만큼만 항목 생성 + 서술식(~입니다) 문체
+async function generateNarrative(opsRows, incRows) {
+  const filled = opsRows.filter(r => r.taskName);
+  if (filled.length === 0) return [];
+
+  const opsText = filled.map((r, i) =>
+    `${i+1}. 팀: ${r.teamName||"미지정"} / 시스템: ${r.systemName||"미지정"} / 업무명: ${r.taskName}` +
+    (detailsText(r) ? ` / 내용: ${detailsText(r)}` : "") +
+    ` / 진행률: ${r.progress}%` +
+    (r.hasIssue ? " / [이슈있음]" : "") +
+    (r.isNew ? " / [신규]" : "") +
+    (r.startDate ? ` / 시작: ${r.startDate}` : "") +
+    (r.endDate ? ` / 완료예정: ${r.endDate}` : "") +
+    (r.itOps ? ` / 담당: ${r.itOps}` : "")
+  ).join("\n");
+
+  const incText = incRows.filter(r=>r.summary).map(r=>
+    `- [${r.system}] ${r.summary}${r.action?` → 조치: ${r.action}`:""} (${r.status})`
+  ).join("\n");
+
+  // ★ 입력된 업무 수만큼 정확히 JSON 배열로 반환 요청
+  const systemPrompt = `당신은 IT운영팀 주간보고 작성 전문가입니다.
+주어진 운영업무 목록을 분석하여 각 업무별로 서술형 주간보고를 작성하세요.
+
+[작성 규칙]
+- 반드시 아래 JSON 배열 형식으로만 응답하세요. 다른 텍스트 절대 포함 금지.
+- 입력된 업무 개수와 동일한 개수의 항목만 생성하세요. 절대 추가/생략 금지.
+- 문체: 반드시 "~하였습니다", "~진행하였습니다", "~완료하였습니다" 등 격식 있는 서술식 종결어미 사용
+- 각 항목은 2~4문장으로 상세하게 작성 (단순 요약 금지)
+- 이슈가 있는 업무는 이슈 상황과 대응 방향도 함께 서술
+- 신규 업무는 착수 배경이나 목적을 포함하여 서술
+
+응답 형식 (업무 개수와 동일하게):
+[
+  {"업무명": "업무명1", "내용": "상세 서술형 내용...입니다."},
+  {"업무명": "업무명2", "내용": "상세 서술형 내용...입니다."}
+]`;
+
+  const userPrompt = `운영업무 목록 (총 ${filled.length}건):\n${opsText}` +
+    (incText ? `\n\n이슈내역:\n${incText}` : "");
+
+  const raw = await callClaude(systemPrompt, userPrompt, 3000);
+  try {
+    const parsed = JSON.parse(raw.replace(/```json|```/g,"").trim());
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return filled.map(r => ({ 업무명: r.taskName, 내용: raw }));
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  Excel 다운로드
+// ══════════════════════════════════════════════════════════
+function downloadExcel(data) {
+  const opsH = ["주간보고차수","팀명","시스템명","업무명","주차","금주 진행 사항(상세)","이슈사항","신규","진행률","시작(예정)일","완료(예정)일","IT운영담당자","IT최적화팀 담당자"];
+  const sheets = [
+    { name:"운영업무", cols:[14,8,20,22,6,50,8,6,8,12,12,12,14],
+      rows:[["운영업무"],[],opsH,...data.ops.filter(r=>r.taskName).map(r=>[
+        data.code,r.teamName,r.systemName,r.taskName,r.week,detailsText(r),
+        r.hasIssue?"Y":"",r.isNew?"Y":"",r.progress+"%",r.startDate,r.endDate,(r.itOpsList||[r.itOps||""]).filter(Boolean).join(", "),r.itOpt])]},
+    { name:"서술보고", cols:[20,80],
+      rows:[["서술보고"],[],["업무명","서술 내용"],...data.nar.filter(r=>r.content).map(r=>[r.taskName||r.category,r.content])]},
+    { name:"개선활동", cols:[14,24,30,30,24,12,12],
+      rows:[["개선활동"],[],["분류","개선항목","현황","개선계획","기대효과","상태","담당자"],
+        ...data.imp.filter(r=>r.title).map(r=>[r.category,r.title,r.current,r.plan,r.effect,r.status,r.itOps])]},
+    { name:"기타사항", cols:[20,80],
+      rows:[["기타사항"],[],["구분","내용"],...data.etc.filter(r=>r.content).map(r=>[r.category,r.content])]},
+    { name:"이슈내역", cols:[12,20,30,30,30,12,12],
+      rows:[["이슈내역"],[],["발생일","시스템","장애요약","원인","조치내용","상태","담당자"],
+        ...data.inc.filter(r=>r.summary).map(r=>[r.occurDate,r.system,r.summary,r.cause,r.action,r.status,r.itOps])]},
+  ];
+  const payload = JSON.stringify({ sheets, fn:`주간보고_${data.code}.xlsx` });
+  const html = `<!DOCTYPE html><html><head><script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script></head><body><script>(function(){
+const d=${payload};const wb=XLSX.utils.book_new();
+d.sheets.forEach(s=>{const ws=XLSX.utils.aoa_to_sheet(s.rows);
+ws['!cols']=s.cols.map(w=>({wch:w}));
+if(s.cols.length>1)ws['!merges']=[{s:{r:0,c:0},e:{r:0,c:s.cols.length-1}}];
+XLSX.utils.book_append_sheet(wb,ws,s.name);});
+XLSX.writeFile(wb,d.fn);setTimeout(()=>window.close(),600);
+})();</script></body></html>`;
+  window.open(URL.createObjectURL(new Blob([html],{type:"text/html"})),"_blank");
+}
+
+// 현재 날짜 기준 ISO 주차 계산
+function getISOWeek() {
+  const now = new Date();
+  const jan1 = new Date(now.getFullYear(), 0, 1);
+  const days = Math.floor((now - jan1) / 86400000);
+  return String(Math.ceil((days + jan1.getDay() + 1) / 7));
+}
+const base = { border:"1px solid #e2e8f0", borderRadius:5, fontSize:12,
+  color:"#1e293b", boxSizing:"border-box", fontFamily:"inherit", background:"#fff" };
+
+const F   = ({v,on,ph,w="100%",type="text"}) =>
+  <input type={type} value={v} onChange={e=>on(e.target.value)} placeholder={ph}
+    style={{...base,width:w,padding:"5px 8px"}} />;
+const TA  = ({v,on,ph,rows=3,w="100%"}) =>
+  <textarea value={v} onChange={e=>on(e.target.value)} placeholder={ph} rows={rows}
+    style={{...base,width:w,padding:"7px 9px",resize:"vertical",lineHeight:1.7}} />;
+const DD  = ({v,on,opts,w=100}) =>
+  <select value={v} onChange={e=>on(e.target.value)}
+    style={{...base,width:w,padding:"5px 6px",cursor:"pointer",background:"#f8fafc"}}>
+    {opts.map(o=><option key={o.v??o} value={o.v??o}>{o.l??o}</option>)}
+  </select>;
+const Tag = ({label,color,bg,border:bd}) =>
+  <span style={{fontSize:10,fontWeight:700,padding:"2px 7px",borderRadius:20,
+    color,background:bg,border:`1px solid ${bd}`,whiteSpace:"nowrap"}}>{label}</span>;
+
+// ══════════════════════════════════════════════════════════
+//  운영업무 탭
+// ══════════════════════════════════════════════════════════
+function OpsTab({ rows, setRows, onGoNarrative }) {
+  const [editingId, setEditingId] = useState(null); // null = 리스트뷰, id = 해당 카드 편집중
+  const [saved,     setSaved]     = useState(false); // 저장완료 상태
+  const [filter,    setFilter]    = useState("");
+
+  const upd = useCallback((id,f,v) => setRows(p=>p.map(r=>r.id===id?{...r,[f]:v}:r)),[setRows]);
+  const lastWeek = () => {
+    const ws = rows.map(r=>parseInt(r.week)).filter(n=>!isNaN(n)&&n>0);
+    return ws.length ? String(Math.max(...ws)) : "1";
+  };
+  const add  = () => { const n={...mkOps(), week:lastWeek()}; setRows(p=>[...p,n]); setEditingId(n.id); setSaved(false); };
+  // 복사: 팀·시스템·주차·담당자 유지, 업무명·내용 초기화 → 편집폼 진입
+  const dup  = id => {
+    const src = rows.find(r=>r.id===id);
+    const c = {...src, id:uid(), taskName:"", detailItems:[""], details:""};
+    setRows(p=>{ const i=p.findIndex(r=>r.id===id); return [...p.slice(0,i+1),c,...p.slice(i+1)]; });
+    setEditingId(c.id);
+    setSaved(false);
+  };
+  const del  = id => { setRows(p=>p.filter(r=>r.id!==id)); if(editingId===id) setEditingId(null); };
+
+  const filled = rows.filter(r=>r.taskName);
+  const issueN = rows.filter(r=>r.hasIssue).length;
+  const newN   = rows.filter(r=>r.isNew).length;
+
+  const vis = filter
+    ? filled.filter(r=>[r.teamName,r.systemName,r.taskName].join(" ").includes(filter))
+    : filled;
+
+  const editingRow = rows.find(r=>r.id===editingId);
+
+  // ── 편집 폼 ──────────────────────────────────────────
+  if (editingId && editingRow) {
+    const row = editingRow;
+    const isIssue = row.hasIssue;
+    const isNew   = row.isNew;
+    const cardBorder = isIssue?"#fca5a5":isNew?"#93c5fd":"#e2e8f0";
+    const cardBg     = isIssue?"#fff8f8":isNew?"#f0f7ff":"#fff";
+
+    return (
+      <div>
+        {/* ── 편집 상단 네비 ── */}
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14}}>
+          <button onClick={()=>setEditingId(null)}
+            style={{padding:"6px 14px",background:"#f1f5f9",border:"1px solid #e2e8f0",
+              borderRadius:7,fontSize:12,cursor:"pointer",color:"#475569"}}>
+            ← 목록으로
+          </button>
+          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+            {row.teamName && <span style={{fontSize:11,background:"#e0f2fe",color:"#0369a1",padding:"2px 8px",borderRadius:10,fontWeight:600}}>{row.teamName}</span>}
+            {row.systemName && <span style={{fontSize:11,background:"#f1f5f9",color:"#475569",padding:"2px 8px",borderRadius:10}}>{row.systemName}</span>}
+            {row.week && <span style={{fontSize:11,color:"#94a3b8"}}>{row.week}주차</span>}
+          </div>
+          <div style={{marginLeft:"auto",display:"flex",gap:8}}>
+            <button onClick={()=>del(row.id)}
+              style={{padding:"6px 12px",background:"#fee2e2",border:"1px solid #fca5a5",
+                borderRadius:7,fontSize:12,cursor:"pointer",color:"#dc2626"}}>🗑 삭제</button>
+            <button onClick={()=>setEditingId(null)}
+              style={{padding:"6px 18px",background:"linear-gradient(135deg,#3b82f6,#1d4ed8)",
+                border:"none",borderRadius:7,fontSize:12,fontWeight:700,cursor:"pointer",color:"#fff"}}>
+              ✓ 저장
+            </button>
+          </div>
+        </div>
+
+        {/* ── 메타 바: 팀/시스템/주차/진행률/이슈신규 ── */}
+        <div style={{background:isIssue?"#fee2e2":isNew?"#dbeafe":"#f8fafc",
+          border:`1.5px solid ${cardBorder}`,borderRadius:"12px 12px 0 0",
+          padding:"10px 16px",display:"flex",alignItems:"center",gap:10,flexWrap:"wrap",
+          borderBottom:`1px solid ${cardBorder}`}}>
+          <DD v={row.teamName}   on={v=>upd(row.id,"teamName",v)}   opts={TEAMS.map(t=>({v:t,l:t||"팀 선택"}))}     w={90}/>
+          <DD v={row.systemName} on={v=>upd(row.id,"systemName",v)} opts={SYSTEMS.map(s=>({v:s,l:s||"시스템 선택"}))} w={150}/>
+          <div style={{display:"flex",alignItems:"center",gap:4}}>
+            <span style={{fontSize:11,color:"#94a3b8"}}>주차</span>
+            <input type="number" value={row.week} onChange={e=>upd(row.id,"week",e.target.value)}
+              placeholder="주차" style={{...base,width:46,padding:"4px 6px",textAlign:"center"}}/>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:4}}>
+            <span style={{fontSize:11,color:"#94a3b8"}}>진행률</span>
+            <select value={row.progress} onChange={e=>upd(row.id,"progress",e.target.value)}
+              style={{...base,width:64,padding:"4px",color:pColor(row.progress),fontWeight:700,background:"#f8fafc"}}>
+              {PROG.map(p=><option key={p} value={p}>{p}%</option>)}
+            </select>
+          </div>
+          <div style={{marginLeft:"auto",display:"flex",gap:6}}>
+            <button onClick={()=>upd(row.id,"hasIssue",!isIssue)}
+              style={{padding:"4px 12px",borderRadius:20,border:"none",cursor:"pointer",fontSize:11,fontWeight:700,
+                background:isIssue?"#dc2626":"#e2e8f0",color:isIssue?"#fff":"#64748b"}}>
+              🔴 이슈{isIssue?" ON":" OFF"}
+            </button>
+            <button onClick={()=>upd(row.id,"isNew",!isNew)}
+              style={{padding:"4px 12px",borderRadius:20,border:"none",cursor:"pointer",fontSize:11,fontWeight:700,
+                background:isNew?"#2563eb":"#e2e8f0",color:isNew?"#fff":"#64748b"}}>
+              🆕 신규{isNew?" ON":" OFF"}
+            </button>
+          </div>
+        </div>
+
+        {/* ── 본문: 두 패널 ── */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:0,
+          border:`1.5px solid ${cardBorder}`,borderTop:"none",borderRadius:"0 0 12px 12px",
+          background:cardBg,overflow:"hidden"}}>
+
+          {/* ▌왼쪽 패널 — 업무 정보 + 담당자 */}
+          <div style={{borderRight:`1.5px solid ${cardBorder}`,padding:"18px 20px",
+            display:"flex",flexDirection:"column",gap:16}}>
+
+            {/* 패널 헤더 */}
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              <div style={{width:3,height:16,background:"#3b82f6",borderRadius:2}}/>
+              <span style={{fontSize:12,fontWeight:800,color:"#1e293b",letterSpacing:"-.3px"}}>업무 정보</span>
+            </div>
+
+            {/* 업무명 */}
+            <div style={{display:"flex",flexDirection:"column",gap:5}}>
+              <label style={{fontSize:11,color:"#64748b",fontWeight:600}}>업무명 *</label>
+              <input value={row.taskName} onChange={e=>upd(row.id,"taskName",e.target.value)}
+                placeholder="업무명을 입력하세요"
+                style={{...base,padding:"8px 10px",fontSize:13,fontWeight:600,
+                  background:"#fff",border:`1.5px solid ${row.taskName?"#3b82f6":"#e2e8f0"}`,
+                  borderRadius:7}}/>
+            </div>
+
+            {/* 진행률 바 */}
+            <div style={{background:"#f8fafc",borderRadius:8,padding:"10px 12px",border:"1px solid #e2e8f0"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                <span style={{fontSize:11,color:"#64748b",fontWeight:600}}>진행률</span>
+                <span style={{fontSize:16,fontWeight:900,color:pColor(row.progress)}}>{row.progress}%</span>
+              </div>
+              <div style={{height:6,background:"#e2e8f0",borderRadius:3,overflow:"hidden"}}>
+                <div style={{height:"100%",width:`${row.progress}%`,
+                  background:`linear-gradient(90deg,${pColor(row.progress)},${pColor(row.progress)}cc)`,
+                  borderRadius:3,transition:"width .4s ease"}}/>
+              </div>
+            </div>
+
+            {/* 기간 (한 번만) */}
+            <div style={{display:"flex",flexDirection:"column",gap:5}}>
+              <label style={{fontSize:11,color:"#64748b",fontWeight:600}}>기간</label>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <input type="date" value={row.startDate} onChange={e=>upd(row.id,"startDate",e.target.value)}
+                  style={{...base,flex:1,padding:"6px 8px",fontSize:11}}/>
+                <span style={{fontSize:11,color:"#94a3b8",flexShrink:0}}>~</span>
+                <input type="date" value={row.endDate} onChange={e=>upd(row.id,"endDate",e.target.value)}
+                  style={{...base,flex:1,padding:"6px 8px",fontSize:11}}/>
+              </div>
+            </div>
+
+            {/* 구분선 */}
+            <div style={{borderTop:"1px solid #e2e8f0",margin:"0 -4px"}}/>
+
+            {/* 담당자 섹션 */}
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+
+              {/* IT운영담당자 — 인라인 태그 방식 */}
+              <div>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:7}}>
+                  <label style={{fontSize:11,color:"#64748b",fontWeight:600}}>👥 IT운영담당자</label>
+                  <button onClick={()=>upd(row.id,"itOpsList",[...(row.itOpsList||[""]),""]) }
+                    style={{fontSize:10,padding:"2px 8px",background:"#dcfce7",border:"1px solid #86efac",
+                      borderRadius:5,cursor:"pointer",color:"#15803d",fontWeight:600,lineHeight:1.4}}>
+                    + 추가
+                  </button>
+                </div>
+                {/* 인라인 태그 목록 */}
+                <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",
+                  minHeight:32,background:"#f8fafc",borderRadius:7,padding:"6px 8px",
+                  border:"1px solid #e2e8f0"}}>
+                  {(row.itOpsList||[""]).map((name,ni)=>(
+                    <div key={ni} style={{display:"flex",alignItems:"center",gap:0,
+                      background:name?"#dcfce7":"#f1f5f9",
+                      border:`1px solid ${name?"#86efac":"#e2e8f0"}`,
+                      borderRadius:20,overflow:"hidden",height:26}}>
+                      <input
+                        value={name}
+                        onChange={e=>{ const a=[...(row.itOpsList||[""])]; a[ni]=e.target.value; upd(row.id,"itOpsList",a); }}
+                        placeholder={`담당자 ${ni+1}`}
+                        style={{border:"none",background:"transparent",outline:"none",
+                          fontSize:11,fontWeight:600,color:"#15803d",
+                          padding:"0 6px 0 10px",width:name?`${Math.max(name.length*8+20,70)}px`:"72px",
+                          minWidth:60,maxWidth:120}}/>
+                      {(row.itOpsList||[""]).length > 1 && (
+                        <button
+                          onClick={()=>{ const a=(row.itOpsList||[""]).filter((_,i)=>i!==ni); upd(row.id,"itOpsList",a); }}
+                          style={{background:"transparent",border:"none",cursor:"pointer",
+                            color:"#dc2626",fontSize:11,padding:"0 7px 0 2px",
+                            height:"100%",display:"flex",alignItems:"center",lineHeight:1}}>
+                          ×
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  {(row.itOpsList||[""]).every(n=>!n) && (
+                    <span style={{fontSize:11,color:"#cbd5e1"}}>담당자를 입력하세요</span>
+                  )}
+                </div>
+              </div>
+
+              {/* IT최적화팀 */}
+              <div>
+                <label style={{fontSize:11,color:"#64748b",fontWeight:600,display:"block",marginBottom:7}}>🔧 IT최적화팀</label>
+                <input value={row.itOpt} onChange={e=>upd(row.id,"itOpt",e.target.value)}
+                  placeholder="IT최적화팀 담당자"
+                  style={{...base,width:"100%",padding:"7px 10px",fontSize:12,borderRadius:7,
+                    border:`1px solid ${row.itOpt?"#7dd3fc":"#e2e8f0"}`,
+                    background:row.itOpt?"#f0f9ff":"#fafafa"}}/>
+              </div>
+            </div>
+          </div>
+
+          {/* ▌오른쪽 패널 — 금주 진행 사항 */}
+          <div style={{padding:"18px 20px",display:"flex",flexDirection:"column",gap:12}}>
+
+            {/* 패널 헤더 */}
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <div style={{width:3,height:16,background:"#8b5cf6",borderRadius:2}}/>
+                <span style={{fontSize:12,fontWeight:800,color:"#1e293b",letterSpacing:"-.3px"}}>금주 진행 사항</span>
+                {isIssue && <Tag label="⚠ 이슈" color="#dc2626" bg="#fee2e2" border="#fca5a5"/>}
+                {isNew   && <Tag label="🆕 신규" color="#1d4ed8" bg="#dbeafe" border="#93c5fd"/>}
+              </div>
+              <button onClick={()=>upd(row.id,"detailItems",[...(row.detailItems||[""]),""]) }
+                style={{fontSize:11,padding:"3px 10px",background:"#ede9fe",border:"1px solid #c4b5fd",
+                  borderRadius:6,cursor:"pointer",color:"#6d28d9",fontWeight:600}}>+ 항목 추가</button>
+            </div>
+
+            {/* 진행 항목 리스트 */}
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              {(row.detailItems||[""]).map((item,di)=>(
+                <div key={di} style={{display:"flex",gap:8,alignItems:"flex-start"}}>
+                  <div style={{width:22,height:22,borderRadius:6,background:"#ede9fe",
+                    display:"flex",alignItems:"center",justifyContent:"center",
+                    fontSize:11,fontWeight:800,color:"#6d28d9",flexShrink:0,marginTop:4}}>
+                    {di+1}
+                  </div>
+                  <textarea value={item}
+                    onChange={e=>{ const a=[...(row.detailItems||[""])]; a[di]=e.target.value; upd(row.id,"detailItems",a); }}
+                    placeholder={`진행 항목 ${di+1} 입력 (예: 배너 디자인 작업)`}
+                    rows={2}
+                    style={{...base,flex:1,padding:"7px 9px",resize:"vertical",
+                      lineHeight:1.65,fontSize:12,borderRadius:7,
+                      border:`1px solid ${item?"#c4b5fd":"#e2e8f0"}`,
+                      background:item?"#fefefe":"#fafafa"}}/>
+                  {(row.detailItems||[""]).length > 1 && (
+                    <button onClick={()=>{ const a=(row.detailItems||[""]).filter((_,i)=>i!==di); upd(row.id,"detailItems",a); }}
+                      style={{width:24,height:24,background:"#fee2e2",border:"1px solid #fca5a5",
+                        borderRadius:6,cursor:"pointer",fontSize:12,color:"#dc2626",
+                        flexShrink:0,marginTop:4,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+
+      </div>
+    );
+  }
+
+  // ── 리스트 뷰 (저장완료 / 기본) ──────────────────────
+  return (
+    <div>
+      {/* 툴바 */}
+      <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:12,flexWrap:"wrap"}}>
+        <div style={{display:"flex",gap:14,alignItems:"center"}}>
+          {[["전체",rows.length,"#3b82f6"],["이슈",issueN,"#dc2626"],["신규",newN,"#2563eb"]].map(([l,v,c])=>(
+            <span key={l} style={{fontSize:12,color:"#64748b"}}>
+              {l} <strong style={{color:c,fontSize:15}}>{v}</strong>
+            </span>
+          ))}
+        </div>
+        <div style={{marginLeft:"auto",display:"flex",gap:8,alignItems:"center"}}>
+          <input value={filter} onChange={e=>setFilter(e.target.value)}
+            placeholder="🔍 검색..." style={{...base,padding:"5px 11px",width:170}} />
+          <button onClick={add}
+            style={{padding:"7px 14px",background:"#f8fafc",border:"1px solid #e2e8f0",
+              borderRadius:7,fontSize:12,cursor:"pointer",color:"#475569",whiteSpace:"nowrap"}}>
+            + 업무 추가
+          </button>
+        </div>
+      </div>
+
+      {/* 저장완료 배너 — 서술보고 이동 버튼 포함 */}
+      {saved && filled.length > 0 && (
+        <div style={{background:"linear-gradient(135deg,#f0fdf4,#dcfce7)",
+          border:"1px solid #86efac",borderRadius:10,padding:"12px 16px",
+          marginBottom:14,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+          <div style={{flex:1}}>
+            <div style={{fontSize:13,fontWeight:700,color:"#15803d",marginBottom:2}}>
+              ✅ 저장 완료 — 총 {filled.length}건의 업무가 저장되었습니다.
+            </div>
+            <div style={{fontSize:11,color:"#16a34a"}}>
+              이제 서술보고를 자동 생성할 수 있습니다.
+            </div>
+          </div>
+          <button onClick={onGoNarrative}
+            style={{padding:"9px 20px",background:"linear-gradient(135deg,#8b5cf6,#6d28d9)",
+              border:"none",borderRadius:8,color:"#fff",fontSize:13,fontWeight:700,
+              cursor:"pointer",whiteSpace:"nowrap",
+              boxShadow:"0 2px 10px rgba(109,40,217,.35)"}}>
+            ✨ 서술보고 자동생성 →
+          </button>
+        </div>
+      )}
+
+      {/* 리스트 */}
+      {vis.length === 0 && (
+        <div style={{background:"#f8fafc",border:"1px dashed #e2e8f0",borderRadius:10,
+          padding:32,textAlign:"center",color:"#94a3b8"}}>
+          <div style={{fontSize:32,marginBottom:8}}>📋</div>
+          <div style={{fontSize:13,marginBottom:4}}>등록된 업무가 없습니다</div>
+          <div style={{fontSize:11}}>위 <strong>+ 업무 추가</strong> 버튼으로 업무를 등록하세요.</div>
+        </div>
+      )}
+
+      <div style={{display:"flex",flexDirection:"column",gap:6}}>
+        {vis.map((row,idx)=>{
+          const isIssue = row.hasIssue;
+          const isNew   = row.isNew;
+          const barColor = isIssue?"#fca5a5":isNew?"#93c5fd":"#e2e8f0";
+
+          return (
+            <div key={row.id}
+              style={{background:isIssue?"#fff8f8":isNew?"#f0f7ff":"#fff",
+                border:`1.5px solid ${barColor}`,borderRadius:10,
+                display:"grid",gridTemplateColumns:"32px 1fr auto",
+                alignItems:"center",gap:0,cursor:"pointer",
+                boxShadow:"0 1px 3px rgba(0,0,0,.04)",transition:"box-shadow .15s"}}
+              onClick={()=>setEditingId(row.id)}>
+
+              {/* 번호 */}
+              <div style={{textAlign:"center",fontSize:11,color:"#94a3b8",fontWeight:700,padding:"14px 0"}}>{idx+1}</div>
+
+              {/* 내용 */}
+              <div style={{padding:"10px 12px 10px 4px"}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
+                  {row.teamName && (
+                    <span style={{fontSize:10,background:"#e0f2fe",color:"#0369a1",
+                      padding:"1px 7px",borderRadius:10,fontWeight:600}}>{row.teamName}</span>
+                  )}
+                  {row.systemName && (
+                    <span style={{fontSize:10,background:"#f1f5f9",color:"#475569",
+                      padding:"1px 7px",borderRadius:10}}>{row.systemName}</span>
+                  )}
+                  {row.week && (
+                    <span style={{fontSize:10,color:"#94a3b8"}}>{row.week}주차</span>
+                  )}
+                  {isIssue && <Tag label="🔴 이슈" color="#dc2626" bg="#fee2e2" border="#fca5a5"/>}
+                  {isNew   && <Tag label="🆕 신규" color="#1d4ed8" bg="#dbeafe" border="#93c5fd"/>}
+                </div>
+                <div style={{display:"flex",alignItems:"center",gap:10}}>
+                  <span style={{fontSize:13,fontWeight:700,color:isIssue?"#dc2626":isNew?"#1d4ed8":"#1e293b"}}>
+                    {row.taskName}
+                  </span>
+                  {(row.detailItems||[]).filter(Boolean).length > 0 && (
+                    <span style={{fontSize:11,color:"#94a3b8",
+                      overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:320}}>
+                      {(row.detailItems||[]).filter(Boolean).map((d,i)=>`${i+1}. ${d}`).join("  ·  ")}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {/* 우측 메타 */}
+              <div style={{display:"flex",alignItems:"center",gap:10,padding:"0 14px",flexShrink:0}}
+                onClick={e=>e.stopPropagation()}>
+                {/* 진행률 */}
+                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                  <div style={{width:48,height:4,background:"#e2e8f0",borderRadius:2,overflow:"hidden"}}>
+                    <div style={{height:"100%",width:`${row.progress}%`,background:pColor(row.progress),borderRadius:2}} />
+                  </div>
+                  <span style={{fontSize:11,fontWeight:700,color:pColor(row.progress),minWidth:28}}>{row.progress}%</span>
+                </div>
+                {(row.itOpsList||[row.itOps||""]).filter(Boolean).length > 0 && <span style={{fontSize:11,color:"#94a3b8"}}>👤 {(row.itOpsList||[row.itOps||""]).filter(Boolean).join(", ")}</span>}
+                {/* 복사 / 삭제 */}
+                <button onClick={()=>{ const newId=dup(row.id); }}
+                  title="이 업무를 복사합니다 (팀·시스템 유지, 업무명·내용 초기화)"
+                  style={{padding:"3px 10px",background:"#eff6ff",border:"1px solid #bfdbfe",
+                    borderRadius:5,cursor:"pointer",fontSize:11,color:"#2563eb",whiteSpace:"nowrap"}}>⧉ 복사</button>
+                <button onClick={()=>del(row.id)}
+                  style={{padding:"3px 8px",background:"#fee2e2",border:"1px solid #fca5a5",
+                    borderRadius:5,cursor:"pointer",fontSize:11,color:"#dc2626"}}>✕</button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* 하단 버튼 영역 */}
+      {filled.length > 0 && (
+        <div style={{marginTop:14,display:"flex",gap:10,justifyContent:"flex-end"}}>
+          <button onClick={add}
+            style={{padding:"8px 18px",background:"#f8fafc",border:"1px solid #e2e8f0",
+              borderRadius:8,fontSize:12,cursor:"pointer",color:"#475569"}}>
+            + 업무 추가
+          </button>
+          {!saved ? (
+            <button onClick={()=>setSaved(true)}
+              style={{padding:"9px 24px",background:"linear-gradient(135deg,#3b82f6,#1d4ed8)",
+                border:"none",borderRadius:8,color:"#fff",fontSize:13,fontWeight:700,
+                cursor:"pointer",boxShadow:"0 2px 8px rgba(37,99,235,.3)"}}>
+              ✅ 저장 완료
+            </button>
+          ) : (
+            <button onClick={onGoNarrative}
+              style={{padding:"9px 24px",background:"linear-gradient(135deg,#8b5cf6,#6d28d9)",
+                border:"none",borderRadius:8,color:"#fff",fontSize:13,fontWeight:700,
+                cursor:"pointer",boxShadow:"0 2px 10px rgba(109,40,217,.35)"}}>
+              ✨ 서술보고 자동생성 →
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  서술보고 탭
+// ══════════════════════════════════════════════════════════
+function NarrativeTab({ items, setItems, opsRows, incRows }) {
+  const [loading,     setLoading]     = useState(false);
+  const [regenTarget, setRegenTarget] = useState(null);
+  const [viewMode,    setViewMode]    = useState("list"); // list | grouped
+
+  const upd = (id,f,v) => setItems(p=>p.map(r=>r.id===id?{...r,[f]:v,aiGenerated:f==="content"?false:r.aiGenerated}:r));
+  const del = id => setItems(p=>p.filter(r=>r.id!==id));
+
+  const filled = opsRows.filter(r=>r.taskName);
+  const hasOps = filled.length > 0;
+
+  // ★ 전체 생성: 입력 업무 개수만큼 항목 생성
+  const handleGenAll = async () => {
+    setLoading(true);
+    try {
+      const result = await generateNarrative(opsRows, incRows);
+      // 업무별 서술 항목으로 변환
+      const newItems = result.map(r => ({
+        id: uid(),
+        taskName: r["업무명"] || "",
+        category: r["업무명"] || "",
+        content:  r["내용"]  || "",
+        aiGenerated: true,
+      }));
+      setItems(newItems);
+    } catch { /* silent */ }
+    setLoading(false);
+  };
+
+  // 개별 재생성
+  const handleRegenOne = async (item) => {
+    setRegenTarget(item.id);
+    try {
+      const result = await generateNarrative(opsRows, incRows);
+      const match = result.find(r => r["업무명"] === item.taskName) || result[0];
+      if (match) setItems(p=>p.map(r=>r.id===item.id?{...r,content:match["내용"]||"",aiGenerated:true}:r));
+    } catch { /* silent */ }
+    setRegenTarget(null);
+  };
+
+  const aiCount = items.filter(r=>r.aiGenerated&&r.content).length;
+
+  // 그룹핑 (팀 > 시스템 > 주차)
+  const buildGrouped = () => {
+    const sorted = [...filled].sort((a,b)=>{
+      if (a.teamName!==b.teamName) return a.teamName.localeCompare(b.teamName,"ko");
+      if (a.systemName!==b.systemName) return a.systemName.localeCompare(b.systemName,"ko");
+      return (parseInt(a.week)||0)-(parseInt(b.week)||0);
+    });
+    const map = {};
+    sorted.forEach(r=>{
+      if (!map[r.teamName]) map[r.teamName]={};
+      if (!map[r.teamName][r.systemName]) map[r.teamName][r.systemName]=[];
+      map[r.teamName][r.systemName].push(r);
+    });
+    return map;
+  };
+
+  const grouped = buildGrouped();
+  const teamColors = ["#3b82f6","#8b5cf6","#16a34a","#d97706","#0891b2","#dc2626","#7c3aed"];
+
+  return (
+    <div>
+      {/* 상단 컨트롤 */}
+      <div style={{background:"linear-gradient(135deg,#f5f3ff,#ede9fe)",border:"1px solid #ddd6fe",
+        borderRadius:10,padding:"12px 16px",marginBottom:14,
+        display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+        <div style={{flex:1,minWidth:180}}>
+          <div style={{fontSize:13,fontWeight:700,color:"#5b21b6",marginBottom:2}}>✨ AI 서술보고 자동생성</div>
+          <div style={{fontSize:11,color:"#7c3aed"}}>
+            {hasOps
+              ? `운영업무 ${filled.length}건 기준으로 각 업무별 서술 보고를 생성합니다.`
+              : "운영업무 탭에서 업무를 먼저 입력·저장하세요."}
+          </div>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+          {aiCount>0 && (
+            <span style={{fontSize:11,color:"#7c3aed",background:"#ede9fe",padding:"3px 10px",borderRadius:20}}>
+              🤖 AI 생성 {aiCount}건
+            </span>
+          )}
+          <div style={{display:"flex",background:"#fff",borderRadius:7,border:"1px solid #ddd6fe",overflow:"hidden"}}>
+            {[["list","📋 목록"],["grouped","🏢 그룹"]].map(([m,l])=>(
+              <button key={m} onClick={()=>setViewMode(m)}
+                style={{padding:"5px 12px",border:"none",background:viewMode===m?"#6d28d9":"transparent",
+                  color:viewMode===m?"#fff":"#7c3aed",fontSize:11,fontWeight:700,cursor:"pointer"}}>
+                {l}
+              </button>
+            ))}
+          </div>
+          <button onClick={handleGenAll} disabled={!hasOps||loading}
+            style={{padding:"8px 18px",background:(!hasOps||loading)?"#e2e8f0":"linear-gradient(135deg,#8b5cf6,#6d28d9)",
+              border:"none",borderRadius:8,color:(!hasOps||loading)?"#94a3b8":"#fff",
+              fontSize:12,fontWeight:700,cursor:(!hasOps||loading)?"not-allowed":"pointer",whiteSpace:"nowrap",
+              boxShadow:hasOps&&!loading?"0 2px 8px rgba(109,40,217,.3)":"none"}}>
+            {loading?"⏳ 생성 중...":aiCount>0?"🔄 전체 재생성":"✨ 자동생성 시작"}
+          </button>
+        </div>
+      </div>
+
+      {/* ── 목록 뷰 ── */}
+      {viewMode==="list" && (
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          {items.length===0 && (
+            <div style={{background:"#f8fafc",border:"1px dashed #e2e8f0",borderRadius:10,
+              padding:28,textAlign:"center",color:"#94a3b8",fontSize:13}}>
+              <div style={{fontSize:28,marginBottom:6}}>📝</div>
+              위 <strong>✨ 자동생성 시작</strong>을 누르면 운영업무 기반으로 서술보고가 작성됩니다.
+            </div>
+          )}
+          {items.map((item,idx)=>(
+            <div key={item.id} style={{background:item.aiGenerated?"#fefce8":"#fff",
+              border:`1px solid ${item.aiGenerated?"#fde047":"#e2e8f0"}`,
+              borderRadius:10,padding:14,boxShadow:"0 1px 3px rgba(0,0,0,.04)"}}>
+              <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:8,flexWrap:"wrap"}}>
+                <span style={{fontSize:11,color:"#94a3b8",minWidth:20,fontWeight:700}}>{idx+1}</span>
+                <span style={{fontSize:12,fontWeight:700,color:"#1e293b"}}>{item.taskName||item.category}</span>
+                {item.aiGenerated && (
+                  <Tag label="🤖 AI 생성" color="#a16207" bg="#fef9c3" border="#fde047"/>
+                )}
+                <div style={{marginLeft:"auto",display:"flex",gap:6}}>
+                  <button onClick={()=>handleRegenOne(item)} disabled={!hasOps||regenTarget===item.id}
+                    style={{padding:"3px 10px",background:hasOps?"#ede9fe":"#f1f5f9",
+                      border:"1px solid #c4b5fd",borderRadius:5,
+                      cursor:hasOps?"pointer":"not-allowed",fontSize:11,
+                      color:hasOps?"#6d28d9":"#94a3b8",whiteSpace:"nowrap"}}>
+                    {regenTarget===item.id?"⏳":"🔄 재생성"}
+                  </button>
+                  <button onClick={()=>del(item.id)}
+                    style={{padding:"3px 10px",background:"#fee2e2",border:"1px solid #fca5a5",
+                      borderRadius:5,cursor:"pointer",fontSize:11,color:"#dc2626"}}>삭제</button>
+                </div>
+              </div>
+              <TA v={item.content} on={v=>upd(item.id,"content",v)}
+                ph="서술 내용을 작성하세요..." rows={4} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ── 그룹 뷰 ── */}
+      {viewMode==="grouped" && (
+        <div style={{display:"flex",flexDirection:"column",gap:14}}>
+          {Object.keys(grouped).length===0 && (
+            <div style={{background:"#f8fafc",border:"1px dashed #e2e8f0",borderRadius:10,
+              padding:24,textAlign:"center",color:"#94a3b8",fontSize:13}}>
+              운영업무 탭에서 업무를 입력하면 팀별로 그룹화됩니다.
+            </div>
+          )}
+          {Object.keys(grouped).map((team,tIdx)=>{
+            const tColor = teamColors[tIdx%teamColors.length];
+            const systems = grouped[team];
+            return (
+              <div key={team} style={{background:"#fff",borderRadius:12,
+                border:"1px solid #e2e8f0",overflow:"hidden",
+                boxShadow:"0 2px 6px rgba(0,0,0,.05)"}}>
+                <div style={{background:`${tColor}10`,borderBottom:"1px solid #e2e8f0",
+                  padding:"10px 16px",display:"flex",alignItems:"center",gap:10}}>
+                  <div style={{width:4,height:20,background:tColor,borderRadius:2}}/>
+                  <span style={{fontSize:14,fontWeight:800,color:tColor}}>🏢 {team||"팀 미지정"}</span>
+                  <span style={{fontSize:11,color:"#94a3b8",background:"#f1f5f9",padding:"2px 8px",borderRadius:20}}>
+                    {Object.values(systems).flat().length}건
+                  </span>
+                </div>
+                <div style={{padding:"10px 14px",display:"flex",flexDirection:"column",gap:10}}>
+                  {Object.keys(systems).map(sys=>{
+                    const tasks = systems[sys];
+                    return (
+                      <div key={sys} style={{background:"#f8fafc",borderRadius:8,border:"1px solid #e2e8f0"}}>
+                        <div style={{background:"#f1f5f9",borderBottom:"1px solid #e2e8f0",
+                          padding:"6px 12px",display:"flex",alignItems:"center",gap:8}}>
+                          <span style={{fontSize:12,fontWeight:700,color:"#475569"}}>💻 {sys||"시스템 미지정"}</span>
+                          {tasks.some(t=>t.hasIssue) && <Tag label="⚠ 이슈" color="#dc2626" bg="#fee2e2" border="#fca5a5"/>}
+                          {tasks.some(t=>t.isNew)    && <Tag label="🆕 신규" color="#1d4ed8" bg="#dbeafe" border="#93c5fd"/>}
+                        </div>
+                        <div style={{padding:"8px 10px",display:"flex",flexDirection:"column",gap:8}}>
+                          {tasks.map(task=>{
+                            // 서술보고에서 이 업무와 매칭된 항목 찾기
+                            const narItem = items.find(n=>n.taskName===task.taskName);
+                            const isIssue = task.hasIssue;
+                            const isNew   = task.isNew;
+                            return (
+                              <div key={task.id}
+                                style={{background:isIssue?"#fff8f8":isNew?"#eff6ff":"#fff",
+                                  border:`1.5px solid ${isIssue?"#fca5a5":isNew?"#93c5fd":"#e2e8f0"}`,
+                                  borderRadius:8,padding:"10px 12px"}}>
+                                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6,flexWrap:"wrap"}}>
+                                  {task.week && (
+                                    <span style={{fontSize:10,fontWeight:700,background:`${tColor}20`,
+                                      color:tColor,padding:"2px 8px",borderRadius:12,border:`1px solid ${tColor}40`}}>
+                                      {task.week}주차
+                                    </span>
+                                  )}
+                                  <span style={{fontSize:13,fontWeight:700,
+                                    color:isIssue?"#dc2626":isNew?"#1d4ed8":"#1e293b"}}>
+                                    {task.taskName}
+                                  </span>
+                                  {isIssue && <Tag label="🔴 이슈" color="#dc2626" bg="#fee2e2" border="#fca5a5"/>}
+                                  {isNew   && <Tag label="🆕 신규" color="#1d4ed8" bg="#dbeafe" border="#93c5fd"/>}
+                                  <span style={{marginLeft:"auto",fontSize:12,fontWeight:700,color:pColor(task.progress)}}>
+                                    {task.progress}%
+                                  </span>
+                                </div>
+                                {task.details && (
+                                  <div style={{fontSize:11,color:"#64748b",marginBottom:6,
+                                    background:"#f8fafc",borderRadius:5,padding:"5px 8px",
+                                    borderLeft:`3px solid ${tColor}60`}}>
+                                    {task.details}
+                                  </div>
+                                )}
+                                {narItem?.content && (
+                                  <div style={{fontSize:12,color:"#1e293b",lineHeight:1.75,
+                                    background:"#fefce8",borderRadius:6,padding:"8px 10px",
+                                    border:"1px solid #fde047",whiteSpace:"pre-wrap"}}>
+                                    <span style={{fontSize:10,color:"#a16207",fontWeight:700,marginRight:6}}>🤖 서술보고</span>
+                                    {narItem.content}
+                                  </div>
+                                )}
+                                <div style={{display:"flex",gap:10,marginTop:6,fontSize:11,color:"#94a3b8",flexWrap:"wrap"}}>
+                                  {task.startDate && <span>📅 {task.startDate}</span>}
+                                  {task.endDate   && <span>🏁 {task.endDate}</span>}
+                                  {task.itOps     && <span>👤 {task.itOps}</span>}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  개선활동 탭
+// ══════════════════════════════════════════════════════════
+function ImproveTab({ rows, setRows, opsRows }) {
+  const [saved,   setSaved]   = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const upd = (id,f,v) => { setRows(p=>p.map(r=>r.id===id?{...r,[f]:v}:r)); setSaved(false); };
+  const add  = () => { setRows(p=>[...p,mkImprove()]); setSaved(false); };
+  const del  = id => { setRows(p=>p.filter(r=>r.id!==id)); setSaved(false); };
+
+  const handleAI = async () => {
+    const filled = opsRows.filter(r=>r.taskName);
+    if (!filled.length) return;
+    setLoading(true);
+    try {
+      const opsText = filled.map((r,i)=>
+        `${i+1}. [${r.teamName||"미지정"}/${r.systemName||"미지정"}] ${r.taskName}` +
+        (detailsText(r)?`: ${detailsText(r)}`:"") + ` (진행률 ${r.progress}%${r.hasIssue?" ⚠이슈":""})`
+      ).join("\n");
+      const sys = `당신은 IT운영팀 개선활동 보고서 전문가입니다. 운영업무 목록을 분석하여 개선이 필요한 항목을 도출하세요.
+반드시 아래 JSON 배열 형식으로만 응답하세요. 다른 텍스트 절대 포함 금지.
+[{"category":"분류(예:자동화/프로세스/시스템)","title":"개선항목명","current":"현재 상황 서술","plan":"개선 계획 서술","effect":"기대 효과 서술","status":"예정","itOps":""}]`;
+      const raw = await callClaude(sys, `운영업무:\n${opsText}`, 2000);
+      const parsed = JSON.parse(raw.replace(/```json|```/g,"").trim());
+      if (Array.isArray(parsed) && parsed.length) {
+        setRows(parsed.map(r=>({id:uid(),...r})));
+        setSaved(false);
+      }
+    } catch { /* silent */ }
+    setLoading(false);
+  };
+
+  const filled = rows.filter(r=>r.title);
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:10}}>
+      {/* AI 자동생성 배너 */}
+      <div style={{background:"linear-gradient(135deg,#f0fdf4,#dcfce7)",border:"1px solid #86efac",
+        borderRadius:10,padding:"10px 16px",display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+        <div style={{flex:1}}>
+          <div style={{fontSize:12,fontWeight:700,color:"#15803d"}}>🤖 AI 개선활동 자동도출</div>
+          <div style={{fontSize:11,color:"#16a34a",marginTop:1}}>운영업무 내용을 분석해 개선이 필요한 항목을 자동으로 추출합니다.</div>
+        </div>
+        <button onClick={handleAI} disabled={loading||!opsRows.filter(r=>r.taskName).length}
+          style={{padding:"7px 16px",background:(loading||!opsRows.filter(r=>r.taskName).length)?"#e2e8f0":"linear-gradient(135deg,#16a34a,#15803d)",
+            border:"none",borderRadius:7,color:(loading||!opsRows.filter(r=>r.taskName).length)?"#94a3b8":"#fff",
+            fontSize:12,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>
+          {loading?"⏳ 분석 중...":"✨ AI 자동도출"}
+        </button>
+      </div>
+
+      {rows.map((row,idx)=>(
+        <div key={row.id} style={{background:row.aiGenerated?"#f0fdf4":"#fff",
+          border:`1px solid ${row.aiGenerated?"#86efac":"#e2e8f0"}`,borderRadius:10,padding:14}}>
+          <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10,flexWrap:"wrap"}}>
+            <span style={{fontSize:11,color:"#94a3b8"}}>{idx+1}</span>
+            <F v={row.category} on={v=>upd(row.id,"category",v)} ph="분류" w={110}/>
+            <F v={row.title}    on={v=>upd(row.id,"title",v)}    ph="개선 항목명" w={200}/>
+            <DD v={row.status}  on={v=>upd(row.id,"status",v)} opts={["예정","진행중","완료","보류"]} w={80}/>
+            <F v={row.itOps}    on={v=>upd(row.id,"itOps",v)}    ph="담당자" w={90}/>
+            <button onClick={()=>del(row.id)}
+              style={{padding:"4px 10px",background:"#fee2e2",border:"1px solid #fca5a5",
+                borderRadius:5,cursor:"pointer",fontSize:11,color:"#dc2626"}}>삭제</button>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10}}>
+            {[["current","현황","현재 상황..."],["plan","개선 계획","개선 방법..."],["effect","기대 효과","예상 효과..."]].map(([f,lb,ph])=>(
+              <div key={f}>
+                <div style={{fontSize:10,color:"#64748b",marginBottom:4,fontWeight:600}}>{lb}</div>
+                <TA v={row[f]} on={v=>upd(row.id,f,v)} ph={ph} rows={3}/>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+
+      <button onClick={add} style={{width:"100%",padding:10,background:"#f8fafc",
+        border:"1px dashed #cbd5e1",borderRadius:10,color:"#64748b",fontSize:13,cursor:"pointer",marginTop:4}}>
+        + 개선 항목 추가
+      </button>
+
+      {filled.length > 0 && (
+        <div style={{display:"flex",justifyContent:"flex-end",marginTop:4}}>
+          {saved ? (
+            <span style={{fontSize:12,color:"#16a34a",fontWeight:600,padding:"8px 0"}}>✅ 저장되었습니다</span>
+          ) : (
+            <button onClick={()=>setSaved(true)}
+              style={{padding:"9px 24px",background:"linear-gradient(135deg,#3b82f6,#1d4ed8)",
+                border:"none",borderRadius:8,color:"#fff",fontSize:13,fontWeight:700,
+                cursor:"pointer",boxShadow:"0 2px 8px rgba(37,99,235,.3)"}}>
+              ✅ 저장 완료
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  기타사항 탭
+// ══════════════════════════════════════════════════════════
+function EtcTab({ items, setItems, opsRows }) {
+  const [saved,   setSaved]   = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const upd = (id,f,v) => { setItems(p=>p.map(r=>r.id===id?{...r,[f]:v}:r)); setSaved(false); };
+  const add  = () => { setItems(p=>[...p,mkEtc(ETC_CATS[0])]); setSaved(false); };
+  const del  = id => { setItems(p=>p.filter(r=>r.id!==id)); setSaved(false); };
+
+  const handleAI = async () => {
+    const filled = opsRows.filter(r=>r.taskName);
+    if (!filled.length) return;
+    setLoading(true);
+    try {
+      const opsText = filled.map((r,i)=>
+        `${i+1}. [${r.teamName||"미지정"}] ${r.taskName}` +
+        (detailsText(r)?`: ${detailsText(r)}`:"") + (r.hasIssue?" ⚠이슈":"")
+      ).join("\n");
+      const sys = `당신은 IT운영팀 주간보고 전문가입니다. 운영업무를 분석해 기타사항(공지, 협업 요청, 외부 이슈, 특이사항 등)을 도출하세요.
+반드시 아래 JSON 배열 형식으로만 응답하세요. 없으면 빈 배열 반환.
+[{"category":"공지사항|협업 요청|외부 이슈|기타 중 하나","content":"내용 서술"}]`;
+      const raw = await callClaude(sys, `운영업무:\n${opsText}`, 1500);
+      const parsed = JSON.parse(raw.replace(/```json|```/g,"").trim());
+      if (Array.isArray(parsed) && parsed.length) {
+        setItems(parsed.map(r=>({id:uid(),...r})));
+        setSaved(false);
+      }
+    } catch { /* silent */ }
+    setLoading(false);
+  };
+
+  const filled = items.filter(r=>r.content);
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:10}}>
+      {/* AI 자동생성 배너 */}
+      <div style={{background:"linear-gradient(135deg,#fefce8,#fef9c3)",border:"1px solid #fde047",
+        borderRadius:10,padding:"10px 16px",display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+        <div style={{flex:1}}>
+          <div style={{fontSize:12,fontWeight:700,color:"#a16207"}}>🤖 AI 기타사항 자동도출</div>
+          <div style={{fontSize:11,color:"#92400e",marginTop:1}}>운영업무에서 공지·협업요청·외부이슈 등을 자동으로 추출합니다.</div>
+        </div>
+        <button onClick={handleAI} disabled={loading||!opsRows.filter(r=>r.taskName).length}
+          style={{padding:"7px 16px",background:(loading||!opsRows.filter(r=>r.taskName).length)?"#e2e8f0":"linear-gradient(135deg,#d97706,#b45309)",
+            border:"none",borderRadius:7,color:(loading||!opsRows.filter(r=>r.taskName).length)?"#94a3b8":"#fff",
+            fontSize:12,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>
+          {loading?"⏳ 분석 중...":"✨ AI 자동도출"}
+        </button>
+      </div>
+
+      {items.map((item,idx)=>(
+        <div key={item.id} style={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:10,padding:14}}>
+          <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:8}}>
+            <span style={{fontSize:11,color:"#94a3b8",minWidth:20}}>{idx+1}</span>
+            <DD v={item.category} on={v=>upd(item.id,"category",v)} opts={ETC_CATS} w={130}/>
+            <button onClick={()=>del(item.id)}
+              style={{marginLeft:"auto",padding:"4px 10px",background:"#fee2e2",border:"1px solid #fca5a5",
+                borderRadius:5,cursor:"pointer",fontSize:11,color:"#dc2626"}}>삭제</button>
+          </div>
+          <TA v={item.content} on={v=>upd(item.id,"content",v)} ph="내용을 작성하세요..." rows={3}/>
+        </div>
+      ))}
+
+      <button onClick={add} style={{width:"100%",padding:10,background:"#f8fafc",
+        border:"1px dashed #cbd5e1",borderRadius:10,color:"#64748b",fontSize:13,cursor:"pointer",marginTop:4}}>
+        + 기타 항목 추가
+      </button>
+
+      {filled.length > 0 && (
+        <div style={{display:"flex",justifyContent:"flex-end",marginTop:4}}>
+          {saved ? (
+            <span style={{fontSize:12,color:"#16a34a",fontWeight:600,padding:"8px 0"}}>✅ 저장되었습니다</span>
+          ) : (
+            <button onClick={()=>setSaved(true)}
+              style={{padding:"9px 24px",background:"linear-gradient(135deg,#3b82f6,#1d4ed8)",
+                border:"none",borderRadius:8,color:"#fff",fontSize:13,fontWeight:700,
+                cursor:"pointer",boxShadow:"0 2px 8px rgba(37,99,235,.3)"}}>
+              ✅ 저장 완료
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  이슈내역 탭
+// ══════════════════════════════════════════════════════════
+function IncidentTab({ rows, setRows, opsRows }) {
+  const [saved,   setSaved]   = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const upd = (id,f,v) => { setRows(p=>p.map(r=>r.id===id?{...r,[f]:v}:r)); setSaved(false); };
+  const add  = () => { setRows(p=>[...p,mkIncident()]); setSaved(false); };
+  const del  = id => { setRows(p=>p.filter(r=>r.id!==id)); setSaved(false); };
+
+  // 이슈 표시된 운영업무를 이슈내역으로 자동변환
+  const handleAI = async () => {
+    const issueRows = opsRows.filter(r=>r.taskName && r.hasIssue);
+    if (!issueRows.length) { alert("이슈(🔴)로 표시된 운영업무가 없습니다."); return; }
+    setLoading(true);
+    try {
+      const opsText = issueRows.map((r,i)=>
+        `${i+1}. [${r.systemName||r.teamName||"미지정"}] ${r.taskName}: ${detailsText(r)||"(상세없음)"}`
+      ).join("\n");
+      const sys = `당신은 IT운영팀 이슈보고서 전문가입니다. 이슈가 있는 업무를 이슈내역 형식으로 변환하세요.
+
+[절대 규칙]
+- 반드시 JSON 배열 형식으로만 응답하세요. 다른 텍스트 절대 포함 금지.
+- 입력된 이슈 업무 건수와 정확히 동일한 개수의 항목만 생성하세요. 절대 추가/분리/병합 금지.
+- 업무 1건 → 이슈내역 1건. 반드시 1:1 대응.
+
+[응답 형식]
+[{"system":"시스템명","summary":"이슈 요약 (서술식 ~입니다)","cause":"추정 원인 서술","action":"조치 내용 서술","status":"처리완료|처리중|모니터링 중 하나","itOps":""}]`;
+      const raw = await callClaude(sys, `이슈 업무 (총 ${issueRows.length}건, 반드시 ${issueRows.length}개 항목만 생성):\n${opsText}`, 2000);
+      const parsed = JSON.parse(raw.replace(/```json|```/g,"").trim());
+      if (Array.isArray(parsed) && parsed.length) {
+        // 혹시 개수가 다르면 입력 건수만큼만 자름
+        const trimmed = parsed.slice(0, issueRows.length);
+        setRows(trimmed.map(r=>({id:uid(), occurDate:"", ...r})));
+        setSaved(false);
+      }
+    } catch { /* silent */ }
+    setLoading(false);
+  };
+
+  const issueCount = opsRows.filter(r=>r.taskName&&r.hasIssue).length;
+  const filled = rows.filter(r=>r.summary);
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:10}}>
+      {/* AI 자동추출 배너 */}
+      <div style={{background:"linear-gradient(135deg,#fff1f2,#ffe4e6)",border:"1px solid #fca5a5",
+        borderRadius:10,padding:"10px 16px",display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+        <div style={{flex:1}}>
+          <div style={{fontSize:12,fontWeight:700,color:"#be123c"}}>🤖 AI 이슈내역 자동추출</div>
+          <div style={{fontSize:11,color:"#9f1239",marginTop:1}}>
+            {issueCount > 0
+              ? `운영업무에서 이슈(🔴) ${issueCount}건을 감지했습니다. 이슈내역으로 자동 변환할 수 있습니다.`
+              : "운영업무에서 🔴 이슈로 표시된 항목이 있으면 자동으로 이슈내역으로 변환합니다."}
+          </div>
+        </div>
+        <button onClick={handleAI} disabled={loading||!issueCount}
+          style={{padding:"7px 16px",background:(loading||!issueCount)?"#e2e8f0":"linear-gradient(135deg,#dc2626,#b91c1c)",
+            border:"none",borderRadius:7,color:(loading||!issueCount)?"#94a3b8":"#fff",
+            fontSize:12,fontWeight:700,cursor:(loading||!issueCount)?"not-allowed":"pointer",whiteSpace:"nowrap"}}>
+          {loading?"⏳ 변환 중...":issueCount>0?`✨ 이슈 ${issueCount}건 → 이슈내역 변환`:"이슈 없음"}
+        </button>
+      </div>
+
+      {rows.length===0 && (
+        <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:10,
+          padding:20,textAlign:"center",color:"#16a34a",fontSize:14}}>
+          ✅ 이번 주 이슈 없음
+        </div>
+      )}
+      {rows.map((row,idx)=>(
+        <div key={row.id} style={{background:"#fff8f8",border:"1px solid #fca5a5",borderRadius:10,padding:14}}>
+          <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10,flexWrap:"wrap"}}>
+            <span style={{fontSize:11,color:"#94a3b8"}}>{idx+1}</span>
+            <Tag label="🚨 이슈" color="#dc2626" bg="#fee2e2" border="#fca5a5"/>
+            <input type="date" value={row.occurDate} onChange={e=>upd(row.id,"occurDate",e.target.value)}
+              style={{...base,width:130,padding:"4px 6px"}}/>
+            <F v={row.system}  on={v=>upd(row.id,"system",v)}  ph="시스템명" w={140}/>
+            <DD v={row.status} on={v=>upd(row.id,"status",v)} opts={["처리완료","처리중","모니터링"]} w={90}/>
+            <F v={row.itOps}   on={v=>upd(row.id,"itOps",v)}   ph="담당자"  w={90}/>
+            <button onClick={()=>del(row.id)}
+              style={{padding:"4px 10px",background:"#fee2e2",border:"1px solid #fca5a5",
+                borderRadius:5,cursor:"pointer",fontSize:11,color:"#dc2626"}}>삭제</button>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10}}>
+            {[["summary","이슈 요약","발생 현상..."],["cause","원인","장애 원인..."],["action","조치 내용","취한 조치..."]].map(([f,lb,ph])=>(
+              <div key={f}>
+                <div style={{fontSize:10,color:"#64748b",marginBottom:4,fontWeight:600}}>{lb}</div>
+                <TA v={row[f]} on={v=>upd(row.id,f,v)} ph={ph} rows={3}/>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+
+      <button onClick={add} style={{width:"100%",padding:10,background:"#fff5f5",
+        border:"1px dashed #fca5a5",borderRadius:10,color:"#dc2626",fontSize:13,cursor:"pointer",marginTop:4}}>
+        + 이슈 항목 직접 추가
+      </button>
+
+      {filled.length > 0 && (
+        <div style={{display:"flex",justifyContent:"flex-end",marginTop:4}}>
+          {saved ? (
+            <span style={{fontSize:12,color:"#16a34a",fontWeight:600,padding:"8px 0"}}>✅ 저장되었습니다</span>
+          ) : (
+            <button onClick={()=>setSaved(true)}
+              style={{padding:"9px 24px",background:"linear-gradient(135deg,#3b82f6,#1d4ed8)",
+                border:"none",borderRadius:8,color:"#fff",fontSize:13,fontWeight:700,
+                cursor:"pointer",boxShadow:"0 2px 8px rgba(37,99,235,.3)"}}>
+              ✅ 저장 완료
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  AI 사이드 패널
+// ══════════════════════════════════════════════════════════
+function AIPanel({ data, onClose }) {
+  const [result,  setResult]  = useState("");
+  const [loading, setLoading] = useState(false);
+  const [mode,    setMode]    = useState("summary");
+  const run = async () => {
+    setLoading(true); setResult("");
+    try {
+      const opsT = data.ops.filter(r=>r.taskName).map((r,i)=>`${i+1}. [${r.teamName}/${r.systemName}] ${r.taskName}: ${r.details} (${r.progress}%)`).join("\n");
+      const narT = data.nar.filter(r=>r.content).map(r=>`[${r.taskName||r.category}] ${r.content}`).join("\n");
+      const incT = data.inc.filter(r=>r.summary).map(r=>`[${r.system}] ${r.summary}`).join("\n");
+      const combined = [opsT&&`[운영업무]\n${opsT}`,narT&&`[서술보고]\n${narT}`,incT&&`[이슈내역]\n${incT}`].filter(Boolean).join("\n\n");
+      const sys = mode==="summary"
+        ? "당신은 IT운영팀 주간보고 전문 비서입니다. ①이번 주 종합 요약(4~5문장) ②주요 성과 3가지 ③이슈/리스크 ④다음 주 중점사항을 각각 구분하여 작성하세요."
+        : "당신은 한국어 교정 전문가입니다. ①맞춤법 오류 ②어색한 표현 ③문구 개선 사항을 [교정 전→교정 후] 형태로 제시하세요. 없으면 '이상 없음'으로 표시하세요.";
+      setResult(await callClaude(sys, combined||"내용 없음"));
+    } catch { setResult("오류가 발생했습니다."); }
+    setLoading(false);
+  };
+  return (
+    <div style={{position:"fixed",right:0,top:0,width:420,height:"100vh",
+      background:"#fff",boxShadow:"-4px 0 20px rgba(0,0,0,.15)",
+      display:"flex",flexDirection:"column",zIndex:1000}}>
+      <div style={{background:"linear-gradient(135deg,#4f46e5,#6366f1)",padding:"15px 20px",
+        display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <span style={{color:"#fff",fontWeight:700,fontSize:15}}>🤖 AI 분석</span>
+        <button onClick={onClose} style={{background:"rgba(255,255,255,.2)",border:"none",
+          borderRadius:6,color:"#fff",padding:"4px 10px",cursor:"pointer",fontSize:13}}>✕ 닫기</button>
+      </div>
+      <div style={{padding:"14px 18px",borderBottom:"1px solid #f1f5f9"}}>
+        <div style={{display:"flex",gap:8,marginBottom:10}}>
+          {[["summary","📋 종합 요약"],["spell","✏️ 철자 교정"]].map(([m,l])=>(
+            <button key={m} onClick={()=>setMode(m)}
+              style={{flex:1,padding:"7px",background:mode===m?"#4f46e5":"#f8fafc",
+                border:`1px solid ${mode===m?"#4f46e5":"#e2e8f0"}`,borderRadius:7,
+                color:mode===m?"#fff":"#64748b",fontSize:12,fontWeight:mode===m?700:400,cursor:"pointer"}}>
+              {l}
+            </button>
+          ))}
+        </div>
+        <button onClick={run} disabled={loading}
+          style={{width:"100%",padding:"9px",background:loading?"#94a3b8":"#4f46e5",
+            border:"none",borderRadius:8,color:"#fff",fontSize:13,fontWeight:700,
+            cursor:loading?"not-allowed":"pointer"}}>
+          {loading?"분석 중...":"분석 실행"}
+        </button>
+      </div>
+      <div style={{flex:1,overflowY:"auto",padding:"16px 18px"}}>
+        {loading && <div style={{textAlign:"center",color:"#94a3b8",paddingTop:40,fontSize:13}}>🤖 분석 중...</div>}
+        {result  && <div style={{fontSize:13,color:"#1e293b",lineHeight:1.85,whiteSpace:"pre-wrap"}}>{result}</div>}
+        {!loading&&!result && <div style={{color:"#94a3b8",fontSize:12,paddingTop:20}}>버튼을 눌러 AI 분석을 시작하세요.</div>}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  메인 앱
+// ══════════════════════════════════════════════════════════
+export default function App() {
+  const [tab,    setTab]    = useState("ops");
+  const [code,   setCode]   = useState("202602-04");
+  const [showAI, setShowAI] = useState(false);
+
+  const [opsRows, setOpsRows] = useState([mkOps(), mkOps()]);
+  const [nar,     setNar]     = useState([]);
+  const [imp,     setImp]     = useState([mkImprove()]);
+  const [etc,     setEtc]     = useState([mkEtc(ETC_CATS[0])]);
+  const [inc,     setInc]     = useState([]);
+
+  // 운영업무 → 서술보고 자동채움 (NarrativeTab에서 호출, App에서 setNar)
+  const handleAutoFill = useCallback(async () => {
+    const result = await generateNarrative(opsRows, inc);
+    setNar(result.map(r => ({
+      id:  uid(),
+      taskName:     r["업무명"] || "",
+      category:     r["업무명"] || "",
+      content:      r["내용"]   || "",
+      aiGenerated:  true,
+    })));
+  }, [opsRows, inc]);
+
+  // 운영업무 저장완료 → 서술보고 탭으로 이동 + 자동생성
+  const handleGoNarrative = useCallback(async () => {
+    setTab("narrative");
+    setTimeout(async () => {
+      try { await handleAutoFill(); } catch { /* silent */ }
+    }, 100);
+  }, [handleAutoFill]);
+
+  const allData = { code, ops:opsRows, nar, imp, etc, inc };
+  const badge = {
+    ops:      opsRows.filter(r=>r.taskName).length,
+    narrative:nar.filter(r=>r.content).length,
+    improve:  imp.filter(r=>r.title).length,
+    etc:      etc.filter(r=>r.content).length,
+    incident: inc.filter(r=>r.summary).length,
+  };
+  const issueCnt = opsRows.filter(r=>r.hasIssue).length + inc.filter(r=>r.summary).length;
+
+  return (
+    <div style={{fontFamily:"'Pretendard','Noto Sans KR','Malgun Gothic',sans-serif",
+      background:"#f1f5f9",minHeight:"100vh",
+      paddingRight:showAI?420:0,transition:"padding .25s",boxSizing:"border-box"}}>
+
+      {/* 헤더 */}
+      <div style={{background:"linear-gradient(90deg,#0f172a,#1e3a5f)",
+        padding:"11px 24px",display:"flex",alignItems:"center",gap:12,
+        boxShadow:"0 2px 8px rgba(0,0,0,.3)",position:"sticky",top:0,zIndex:200}}>
+        <div style={{background:"#3b82f6",borderRadius:8,width:32,height:32,
+          display:"flex",alignItems:"center",justifyContent:"center",fontSize:17,flexShrink:0}}>📊</div>
+        <div style={{flexShrink:0}}>
+          <div style={{color:"#fff",fontWeight:800,fontSize:14}}>운영업무 주간보고 시스템</div>
+          <div style={{color:"#94a3b8",fontSize:10}}>IT운영팀 · 격주 주간보고 자동화</div>
+        </div>
+        {issueCnt>0 && (
+          <div style={{background:"#dc2626",color:"#fff",fontSize:11,fontWeight:700,
+            padding:"2px 10px",borderRadius:20,flexShrink:0}}>🔴 이슈 {issueCnt}건</div>
+        )}
+        <div style={{marginLeft:"auto",display:"flex",gap:8,alignItems:"center"}}>
+          <span style={{color:"#94a3b8",fontSize:11,whiteSpace:"nowrap"}}>보고차수</span>
+          <input value={code} onChange={e=>setCode(e.target.value)}
+            style={{padding:"4px 8px",background:"#1e293b",border:"1px solid #334155",
+              borderRadius:6,color:"#e2e8f0",fontSize:12,width:100}}/>
+          <button onClick={()=>setShowAI(s=>!s)}
+            style={{padding:"6px 13px",background:showAI?"#4f46e5":"#1e293b",
+              border:`1px solid ${showAI?"#4f46e5":"#334155"}`,
+              borderRadius:7,color:"#fff",fontSize:12,fontWeight:600,cursor:"pointer",whiteSpace:"nowrap"}}>
+            🤖 AI 분석
+          </button>
+          <button onClick={()=>downloadExcel(allData)}
+            style={{padding:"6px 14px",background:"linear-gradient(135deg,#16a34a,#15803d)",
+              border:"none",borderRadius:7,color:"#fff",fontSize:12,fontWeight:700,
+              cursor:"pointer",whiteSpace:"nowrap"}}>
+            📥 Excel 다운로드
+          </button>
+        </div>
+      </div>
+
+      {/* 탭 바 */}
+      <div style={{background:"#fff",borderBottom:"2px solid #e2e8f0",
+        display:"flex",padding:"0 24px",overflowX:"auto",position:"sticky",top:54,zIndex:190}}>
+        {TABS.map(t=>{
+          const cnt = badge[t.id]??0;
+          const active = tab===t.id;
+          return (
+            <button key={t.id} onClick={()=>setTab(t.id)}
+              style={{padding:"11px 18px",border:"none",
+                borderBottom:`2.5px solid ${active?"#3b82f6":"transparent"}`,
+                background:"transparent",cursor:"pointer",
+                display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",
+                color:active?"#1d4ed8":"#64748b",
+                fontWeight:active?700:400,fontSize:13,marginBottom:-2}}>
+              <span style={{fontSize:14}}>{t.icon}</span>
+              <span>{t.label}</span>
+              {t.primary && <span style={{fontSize:8,color:"#3b82f6"}}>●</span>}
+              {cnt>0 && (
+                <span style={{background:active?"#3b82f6":"#e2e8f0",color:active?"#fff":"#64748b",
+                  fontSize:10,fontWeight:700,padding:"1px 6px",borderRadius:20}}>{cnt}</span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* 콘텐츠 */}
+      <div style={{padding:"18px 24px"}}>
+        {tab==="ops"       && <OpsTab      rows={opsRows}  setRows={setOpsRows} onGoNarrative={handleGoNarrative}/>}
+        {tab==="narrative" && <NarrativeTab items={nar} setItems={setNar} opsRows={opsRows} incRows={inc} />}
+        {tab==="improve"   && <ImproveTab  rows={imp}   setRows={setImp}  opsRows={opsRows}/>}
+        {tab==="etc"       && <EtcTab      items={etc}  setItems={setEtc} opsRows={opsRows}/>}
+        {tab==="incident"  && <IncidentTab rows={inc}   setRows={setInc}  opsRows={opsRows}/>}
+      </div>
+
+      {showAI && <AIPanel data={allData} onClose={()=>setShowAI(false)}/>}
+    </div>
+  );
+}
